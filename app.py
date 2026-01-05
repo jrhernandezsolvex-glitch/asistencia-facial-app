@@ -224,7 +224,6 @@ with tab1:
     st.code(f"{type(e).__name__}: {e}")
     st.stop()
 
-
 with tab2:
     st.subheader("Enrolar personas (solo admin)")
 
@@ -283,4 +282,5 @@ with tab2:
             st.rerun()
         else:
             st.error("No existe ese nombre.")
+
 
