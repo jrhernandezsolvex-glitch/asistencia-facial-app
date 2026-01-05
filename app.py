@@ -1,3 +1,31 @@
+# app.py — Asistencia facial (selfie 1 a 1) + Enrolamiento (admin) + Google Sheets (robusto con SPREADSHEET_ID)
+# ---------------------------------------------------------------------------------------
+# Requisitos (requirements.txt):
+# streamlit
+# numpy
+# pandas
+# opencv-python-headless
+# insightface
+# onnxruntime
+# gspread
+# google-auth
+#
+# Secrets (Streamlit -> Settings -> Secrets):
+# SHEET_NAME = "Asistencia Facial"
+# WORKSHEET_NAME = "Hoja 1"
+# SPREADSHEET_ID = "TU_ID_DE_SHEET"   # recomendado (entre /d/ y /edit)
+# ADMIN_PASSWORD = "1234"            # opcional
+#
+# [gcp_service_account]
+# type="service_account"
+# project_id="..."
+# private_key_id="..."
+# private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+# client_email="...@....iam.gserviceaccount.com"
+# client_id="..."
+# token_uri="https://oauth2.googleapis.com/token"
+# ---------------------------------------------------------------------------------------
+
 import os
 from datetime import datetime, date
 
@@ -8,8 +36,12 @@ import streamlit as st
 
 import gspread
 from google.oauth2.service_account import Credentials
+
 from insightface.app import FaceAnalysis
 
+# ----------------------------
+# CONFIG
+# ----------------------------
 st.set_page_config(page_title="Asistencia Facial", page_icon="✅", layout="centered")
 
 APP_TITLE = "✅ Asistencia por Selfie"
@@ -17,10 +49,17 @@ DEFAULT_THRESHOLD = 0.38
 
 SHEET_NAME = st.secrets.get("SHEET_NAME", "Asistencia Facial")
 WORKSHEET_NAME = st.secrets.get("WORKSHEET_NAME", "Hoja 1")
+SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")  # recomendado: abre por ID (robusto)
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")  # opcional
 
+# DB local en el contenedor de Streamlit Cloud.
+# Nota: en Streamlit Community Cloud el filesystem puede resetearse al reiniciar.
+# Para 6 personas funciona, pero si quieres persistencia real, luego lo migramos a Sheets/Drive.
 DB_FILE = "face_db_multi.npz"
 
+# ----------------------------
+# FACE MODEL (cache)
+# ----------------------------
 @st.cache_resource
 def load_model():
     app = FaceAnalysis(name="buffalo_l")
@@ -33,19 +72,23 @@ def get_face_embedding(img_bgr):
     faces = model.get(img_bgr)
     if not faces:
         return None
+    # si detecta más de uno, toma el más grande
     faces = sorted(
         faces,
-        key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]),
-        reverse=True
+        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+        reverse=True,
     )
     return faces[0].normed_embedding.astype(np.float32)
 
+# ----------------------------
+# DB (multi embeddings per person)
+# ----------------------------
 def load_db():
     if not os.path.exists(DB_FILE):
         return {}
     data = np.load(DB_FILE, allow_pickle=True)
     names = data["names"].tolist()
-    embs  = data["embs"]
+    embs = data["embs"]
     db = {}
     for name, emb in zip(names, embs):
         db.setdefault(name, []).append(emb.astype(np.float32))
@@ -58,11 +101,12 @@ def save_db(db):
             names.append(name)
             embs.append(emb)
     if not embs:
-        np.savez(DB_FILE, names=np.array([], dtype=object), embs=np.zeros((0,512), np.float32))
+        np.savez(DB_FILE, names=np.array([], dtype=object), embs=np.zeros((0, 512), np.float32))
     else:
         np.savez(DB_FILE, names=np.array(names, dtype=object), embs=np.stack(embs).astype(np.float32))
 
 def cosine_sim(a, b):
+    # embeddings ya normalizados
     return float(np.dot(a, b))
 
 def identify(db, emb, threshold):
@@ -75,44 +119,66 @@ def identify(db, emb, threshold):
         return None, best_score
     return best_name, best_score
 
+# ----------------------------
+# GOOGLE SHEETS (service account)
+# ----------------------------
 @st.cache_resource
 def get_gs_client():
     creds_info = st.secrets.get("gcp_service_account")
     if creds_info is None:
-        st.error("Faltan credenciales en Secrets: gcp_service_account")
+        st.error("Faltan credenciales en Secrets: [gcp_service_account].")
         st.stop()
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+
+    # Scopes recomendados: spreadsheets + drive.readonly (por si hace falta resolver metadata).
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+
     creds = Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
     return gspread.authorize(creds)
 
 def open_sheet():
     gc = get_gs_client()
-    sh = gc.open(SHEET_NAME)
+
+    # ✅ Preferido: abre por ID (evita listar Drive por título y reduce fallos).
+    if SPREADSHEET_ID and str(SPREADSHEET_ID).strip():
+        sh = gc.open_by_key(str(SPREADSHEET_ID).strip())
+    else:
+        # Fallback por nombre (menos robusto)
+        sh = gc.open(SHEET_NAME)
+
     return sh.worksheet(WORKSHEET_NAME)
 
 def read_attendance_df(ws):
     values = ws.get_all_values()
     if not values:
-        return pd.DataFrame(columns=["fecha_hora","nombre","score"])
+        return pd.DataFrame(columns=["fecha_hora", "nombre", "score"])
     header = values[0]
     rows = values[1:]
     df = pd.DataFrame(rows, columns=header)
-    for col in ["fecha_hora","nombre","score"]:
+    # asegurar columnas
+    for col in ["fecha_hora", "nombre", "score"]:
         if col not in df.columns:
             df[col] = ""
-    return df[["fecha_hora","nombre","score"]]
+    return df[["fecha_hora", "nombre", "score"]]
 
 def already_marked_today(df, name):
     today = date.today().isoformat()
     if df.empty:
         return False
-    return any((df["nombre"].astype(str) == name) &
-               (df["fecha_hora"].astype(str).str.startswith(today)))
+    return any(
+        (df["nombre"].astype(str) == name)
+        & (df["fecha_hora"].astype(str).str.startswith(today))
+    )
 
 def append_attendance(ws, name, score):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws.append_row([now, name, round(float(score), 4)], value_input_option="USER_ENTERED")
 
+# ----------------------------
+# UI
+# ----------------------------
 st.title(APP_TITLE)
 st.caption("Toma una selfie y se registrará tu asistencia en Google Sheets.")
 
@@ -134,22 +200,31 @@ with tab1:
         if emb is None:
             st.error("No se detectó rostro. Intenta con mejor luz y más cerca.")
         elif len(db) == 0:
-            st.error("❌ No hay personas registradas.")
+            st.error("❌ No hay personas registradas. Ve a ⚙️ Administración para enrolar.")
         else:
-            name, score = identify(db, emb, threshold)
-            if name is None:
-                st.error(f"No identificado. score={score:.3f} (umbral={threshold:.2f})")
-            else:
-                ws = open_sheet()
-                df = read_attendance_df(ws)
-                if already_marked_today(df, name):
-                    st.info(f"{name} ya marcó asistencia hoy. (no se duplica)")
+            try:
+                name, score = identify(db, emb, threshold)
+                if name is None:
+                    st.error(f"No identificado. score={score:.3f} (umbral={threshold:.2f})")
                 else:
-                    append_attendance(ws, name, score)
-                    st.success(f"Asistencia registrada: {name} (score={score:.3f})")
+                    ws = open_sheet()
+                    df = read_attendance_df(ws)
 
-                st.subheader("Últimos registros")
-                st.dataframe(read_attendance_df(ws).tail(10), use_container_width=True)
+                    if already_marked_today(df, name):
+                        st.info(f"{name} ya marcó asistencia hoy. (no se duplica)")
+                    else:
+                        append_attendance(ws, name, score)
+                        st.success(f"Asistencia registrada: {name} (score={score:.3f})")
+
+                    st.subheader("Últimos registros")
+                    st.dataframe(read_attendance_df(ws).tail(10), use_container_width=True)
+
+            except Exception:
+                st.error(
+                    "Error conectando con Google Sheets. "
+                    "Ve a Manage app → Logs para ver el detalle."
+                )
+                st.stop()
 
 with tab2:
     st.subheader("Enrolar personas (solo admin)")
@@ -159,11 +234,13 @@ with tab2:
         if pwd != ADMIN_PASSWORD:
             st.info("Ingresa la contraseña para enrolar.")
             st.stop()
+    else:
+        st.caption("ADMIN_PASSWORD no está configurado. Cualquiera con el link podría enrolar.")
 
     st.write("Recomendado: **3 selfies** (frente, leve izq, leve der).")
 
     new_name = st.text_input("Nombre (exacto)")
-    n_photos = st.selectbox("Cantidad de selfies", [1,2,3,4,5], index=2)
+    n_photos = st.selectbox("Cantidad de selfies", [1, 2, 3, 4, 5], index=2)
 
     if "enroll_embs" not in st.session_state:
         st.session_state.enroll_embs = []
@@ -188,7 +265,7 @@ with tab2:
         else:
             name = new_name.strip()
             db.setdefault(name, [])
-            db[name].extend(st.session_state.enroll_embs[:int(n_photos)])
+            db[name].extend(st.session_state.enroll_embs[: int(n_photos)])
             save_db(db)
             st.session_state.enroll_embs = []
             st.success(f"Registrado: {name}")
@@ -196,7 +273,7 @@ with tab2:
 
     st.divider()
     st.subheader("Personas registradas")
-    st.write({k: len(v) for k,v in db.items()})
+    st.write({k: len(v) for k, v in db.items()})
 
     del_name = st.text_input("Nombre exacto a eliminar")
     if st.button("🗑️ Eliminar persona"):
