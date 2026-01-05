@@ -1,0 +1,8 @@
+streamlit
+numpy
+pandas
+opencv-python-headless
+insightface
+onnxruntime
+gspread
+google-auth
