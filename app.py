@@ -63,10 +63,10 @@ EXIT_TARGET  = time(17, 15)  # 17:15
 
 # Ventanas permitidas (tolerancia)
 ENTRY_WINDOW_START = time(7, 0)
-ENTRY_WINDOW_END   = time(15, 0)
+ENTRY_WINDOW_END   = time(12, 0)
 
 EXIT_WINDOW_START  = time(16, 0)
-EXIT_WINDOW_END    = time(18, 30)
+EXIT_WINDOW_END    = time(20, 30)
 
 # ----------------------------
 # FACE MODEL (cache)
@@ -363,5 +363,6 @@ with tab2:
             st.rerun()
         else:
             st.error("No existe ese nombre.")
+
 
 
