@@ -1,6 +1,6 @@
 # app.py — Asistencia facial (selfie 1 a 1) + Enrolamiento (admin) + Google Sheets (robusto con SPREADSHEET_ID)
-# ---------------------------------------------------------------------------------------
-# Requisitos (requirements.txt):
+# -------------------------------------------------------------------------------------------------
+# requirements.txt:
 # streamlit
 # numpy
 # pandas
@@ -10,7 +10,7 @@
 # gspread
 # google-auth
 #
-# Secrets (Streamlit -> Settings -> Secrets):
+# Streamlit Secrets (Settings → Secrets):
 # SHEET_NAME = "Asistencia Facial"
 # WORKSHEET_NAME = "Hoja 1"
 # SPREADSHEET_ID = "TU_ID_DE_SHEET"   # recomendado (entre /d/ y /edit)
@@ -24,7 +24,7 @@
 # client_email="...@....iam.gserviceaccount.com"
 # client_id="..."
 # token_uri="https://oauth2.googleapis.com/token"
-# ---------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
 
 import os
 from datetime import datetime, date
@@ -52,9 +52,6 @@ WORKSHEET_NAME = st.secrets.get("WORKSHEET_NAME", "Hoja 1")
 SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")  # recomendado: abre por ID (robusto)
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")  # opcional
 
-# DB local en el contenedor de Streamlit Cloud.
-# Nota: en Streamlit Community Cloud el filesystem puede resetearse al reiniciar.
-# Para 6 personas funciona, pero si quieres persistencia real, luego lo migramos a Sheets/Drive.
 DB_FILE = "face_db_multi.npz"
 
 # ----------------------------
@@ -72,7 +69,6 @@ def get_face_embedding(img_bgr):
     faces = model.get(img_bgr)
     if not faces:
         return None
-    # si detecta más de uno, toma el más grande
     faces = sorted(
         faces,
         key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
@@ -100,6 +96,7 @@ def save_db(db):
         for emb in arr:
             names.append(name)
             embs.append(emb)
+
     if not embs:
         np.savez(DB_FILE, names=np.array([], dtype=object), embs=np.zeros((0, 512), np.float32))
     else:
@@ -129,7 +126,6 @@ def get_gs_client():
         st.error("Faltan credenciales en Secrets: [gcp_service_account].")
         st.stop()
 
-    # Scopes recomendados: spreadsheets + drive.readonly (por si hace falta resolver metadata).
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.readonly",
@@ -141,11 +137,9 @@ def get_gs_client():
 def open_sheet():
     gc = get_gs_client()
 
-    # ✅ Preferido: abre por ID (evita listar Drive por título y reduce fallos).
     if SPREADSHEET_ID and str(SPREADSHEET_ID).strip():
         sh = gc.open_by_key(str(SPREADSHEET_ID).strip())
     else:
-        # Fallback por nombre (menos robusto)
         sh = gc.open(SHEET_NAME)
 
     return sh.worksheet(WORKSHEET_NAME)
@@ -157,7 +151,6 @@ def read_attendance_df(ws):
     header = values[0]
     rows = values[1:]
     df = pd.DataFrame(rows, columns=header)
-    # asegurar columnas
     for col in ["fecha_hora", "nombre", "score"]:
         if col not in df.columns:
             df[col] = ""
@@ -204,6 +197,7 @@ with tab1:
         else:
             try:
                 name, score = identify(db, emb, threshold)
+
                 if name is None:
                     st.error(f"No identificado. score={score:.3f} (umbral={threshold:.2f})")
                 else:
@@ -217,12 +211,15 @@ with tab1:
                         st.success(f"Asistencia registrada: {name} (score={score:.3f})")
 
                     st.subheader("Últimos registros")
-                    st.dataframe(read_attendance_df(ws).tail(10), use_container_width=True)
+                    st.dataframe(
+                        read_attendance_df(ws).tail(10),
+                        use_container_width=True
+                    )
 
-           except Exception as e:
-    st.error("Error conectando con Google Sheets (detalle):")
-    st.code(f"{type(e).__name__}: {e}")
-    st.stop()
+            except Exception as e:
+                st.error("Error conectando con Google Sheets (detalle):")
+                st.code(f"{type(e).__name__}: {e}")
+                st.stop()
 
 with tab2:
     st.subheader("Enrolar personas (solo admin)")
@@ -282,5 +279,3 @@ with tab2:
             st.rerun()
         else:
             st.error("No existe ese nombre.")
-
-
