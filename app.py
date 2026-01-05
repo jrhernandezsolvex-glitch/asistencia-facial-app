@@ -1,5 +1,32 @@
+# app.py — Asistencia facial (selfie 1 a 1) + Enrolamiento (admin) + ENTRADA/SALIDA por horario + Google Sheets
+# -------------------------------------------------------------------------------------------------
+# requirements.txt:
+# streamlit
+# numpy
+# pandas
+# opencv-python-headless
+# insightface
+# onnxruntime
+# gspread
+# google-auth
+#
+# Streamlit Secrets (Settings → Secrets):
+# SHEET_NAME = "Asistencia Facial"
+# WORKSHEET_NAME = "Hoja 1"
+# SPREADSHEET_ID = "TU_ID_DE_SHEET"   # recomendado (entre /d/ y /edit)
+# ADMIN_PASSWORD = "1234"            # opcional
+#
+# [gcp_service_account]
+# type="service_account"
+# project_id="asistencia-facial-solvex"
+# private_key_id="..."
+# private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+# client_email="...@asistencia-facial-solvex.iam.gserviceaccount.com"
+# client_id="..."
+# token_uri="https://oauth2.googleapis.com/token"
+# -------------------------------------------------------------------------------------------------
+
 import os
-import io
 from datetime import datetime, date, time
 
 import numpy as np
@@ -9,9 +36,6 @@ import streamlit as st
 
 import gspread
 from google.oauth2.service_account import Credentials
-
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 from insightface.app import FaceAnalysis
 from zoneinfo import ZoneInfo
@@ -23,7 +47,7 @@ st.set_page_config(page_title="Asistencia Facial", page_icon="✅", layout="cent
 
 TZ = ZoneInfo("America/Lima")
 
-APP_TITLE = "✅ Asistencia por Selfie"
+APP_TITLE = "✅ Asistencia por Selfie (Entrada/Salida)"
 DEFAULT_THRESHOLD = 0.38
 
 SHEET_NAME = st.secrets.get("SHEET_NAME", "Asistencia Facial")
@@ -31,21 +55,18 @@ WORKSHEET_NAME = st.secrets.get("WORKSHEET_NAME", "Hoja 1")
 SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
 
-# Carpeta en Drive (creada por ti y compartida como Editor con la Service Account)
-DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
-
 DB_FILE = "face_db_multi.npz"
 
-# Horarios objetivo
+# Horarios objetivo (informativos)
 ENTRY_TARGET = time(7, 45)   # 07:45
 EXIT_TARGET  = time(17, 15)  # 17:15
 
-# Ventanas permitidas (recomendado para tolerancia)
+# Ventanas permitidas (tolerancia)
 ENTRY_WINDOW_START = time(7, 0)
 ENTRY_WINDOW_END   = time(15, 0)
 
 EXIT_WINDOW_START  = time(16, 0)
-EXIT_WINDOW_END    = time(10, 30)
+EXIT_WINDOW_END    = time(18, 30)
 
 # ----------------------------
 # FACE MODEL (cache)
@@ -62,6 +83,7 @@ def get_face_embedding(img_bgr):
     faces = model.get(img_bgr)
     if not faces:
         return None
+    # si hay varios rostros, elegir el más grande
     faces = sorted(
         faces,
         key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
@@ -96,6 +118,7 @@ def save_db(db):
         np.savez(DB_FILE, names=np.array(names, dtype=object), embs=np.stack(embs).astype(np.float32))
 
 def cosine_sim(a, b):
+    # embeddings ya normalizados
     return float(np.dot(a, b))
 
 def identify(db, emb, threshold):
@@ -109,10 +132,10 @@ def identify(db, emb, threshold):
     return best_name, best_score
 
 # ----------------------------
-# GOOGLE AUTH (service account)
+# GOOGLE SHEETS (service account)
 # ----------------------------
 @st.cache_resource
-def get_google_credentials():
+def get_gs_client():
     creds_info = st.secrets.get("gcp_service_account")
     if creds_info is None:
         st.error("Faltan credenciales en Secrets: [gcp_service_account].")
@@ -120,23 +143,12 @@ def get_google_credentials():
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.readonly",
     ]
-    return Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
 
-@st.cache_resource
-def get_gs_client():
-    creds = get_google_credentials()
+    creds = Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
     return gspread.authorize(creds)
 
-@st.cache_resource
-def get_drive_service():
-    creds = get_google_credentials()
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-# ----------------------------
-# GOOGLE SHEETS
-# ----------------------------
 def open_sheet():
     gc = get_gs_client()
     if SPREADSHEET_ID and str(SPREADSHEET_ID).strip():
@@ -145,30 +157,33 @@ def open_sheet():
         sh = gc.open(SHEET_NAME)
     return sh.worksheet(WORKSHEET_NAME)
 
+# ----------------------------
+# SHEET HELPERS
+# ----------------------------
 def ensure_sheet_header(ws):
     values = ws.get_all_values()
     if not values:
-        ws.append_row(["fecha_hora", "nombre", "tipo", "score", "foto_url"], value_input_option="USER_ENTERED")
+        ws.append_row(["fecha_hora", "nombre", "tipo", "score"], value_input_option="USER_ENTERED")
         return
+
     header = values[0]
-    needed = ["fecha_hora", "nombre", "tipo", "score", "foto_url"]
+    needed = ["fecha_hora", "nombre", "tipo", "score"]
     if header != needed:
-        # Si el header existe pero no coincide, lo normalizamos (sin borrar data).
-        # Insertamos fila 1 si no coincide.
-        if header != needed:
-            ws.insert_row(needed, index=1)
+        # Insertar header correcto como primera fila (no borra nada)
+        ws.insert_row(needed, index=1)
 
 def read_attendance_df(ws):
     values = ws.get_all_values()
     if not values:
-        return pd.DataFrame(columns=["fecha_hora", "nombre", "tipo", "score", "foto_url"])
+        return pd.DataFrame(columns=["fecha_hora", "nombre", "tipo", "score"])
     header = values[0]
     rows = values[1:]
     df = pd.DataFrame(rows, columns=header)
-    for col in ["fecha_hora", "nombre", "tipo", "score", "foto_url"]:
+    # asegurar columnas
+    for col in ["fecha_hora", "nombre", "tipo", "score"]:
         if col not in df.columns:
             df[col] = ""
-    return df[["fecha_hora", "nombre", "tipo", "score", "foto_url"]]
+    return df[["fecha_hora", "nombre", "tipo", "score"]]
 
 def marked_today(df, name, tipo):
     today_str = date.today().isoformat()
@@ -184,42 +199,14 @@ def marked_today(df, name, tipo):
 def has_entry_today(df, name):
     return marked_today(df, name, "ENTRADA")
 
-def append_attendance(ws, name, tipo, score, foto_url):
+def append_attendance(ws, name, tipo, score):
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-    ws.append_row([now, name, tipo, round(float(score), 4), foto_url], value_input_option="USER_ENTERED")
-
-# ----------------------------
-# DRIVE UPLOAD
-# ----------------------------
-def upload_photo_to_drive(image_bytes: bytes, filename: str) -> str:
-    """
-    Sube la foto a Google Drive dentro de DRIVE_FOLDER_ID y devuelve una URL visible.
-    Requisito: la carpeta debe estar compartida como Editor con el client_email de la service account.
-    """
-    if not DRIVE_FOLDER_ID:
-        raise RuntimeError("Falta DRIVE_FOLDER_ID en Secrets.")
-
-    drive = get_drive_service()
-    media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg", resumable=False)
-
-    file_metadata = {
-        "name": filename,
-        "parents": [DRIVE_FOLDER_ID],
-    }
-
-    created = drive.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id, webViewLink"
-    ).execute()
-
-    # webViewLink suele venir ya listo; si no, armamos link por id
-    return created.get("webViewLink") or f"https://drive.google.com/file/d/{created['id']}/view"
+    ws.append_row([now, name, tipo, round(float(score), 4)], value_input_option="USER_ENTERED")
 
 # ----------------------------
 # BUSINESS LOGIC: ENTRY / EXIT
 # ----------------------------
-def decide_tipo(now_t: time) -> str | None:
+def decide_tipo(now_t: time):
     """Devuelve ENTRADA, SALIDA o None si está fuera de horario permitido."""
     if ENTRY_WINDOW_START <= now_t <= ENTRY_WINDOW_END:
         return "ENTRADA"
@@ -231,7 +218,7 @@ def decide_tipo(now_t: time) -> str | None:
 # UI
 # ----------------------------
 st.title(APP_TITLE)
-st.caption("Toma una selfie. Se registrará ENTRADA o SALIDA según la hora y se guardará la foto en Drive.")
+st.caption("Toma una selfie. Se registrará ENTRADA o SALIDA según la hora y se guardará en Google Sheets.")
 
 db = load_db()
 
@@ -247,22 +234,23 @@ with tab1:
 
     st.info(
         f"Hora actual: **{now_dt.strftime('%H:%M:%S')}**  | "
-        f"Ventana ENTRADA: **{ENTRY_WINDOW_START.strftime('%H:%M')}–{ENTRY_WINDOW_END.strftime('%H:%M')}**  | "
-        f"Ventana SALIDA: **{EXIT_WINDOW_START.strftime('%H:%M')}–{EXIT_WINDOW_END.strftime('%H:%M')}**"
+        f"Entrada objetivo: **{ENTRY_TARGET.strftime('%H:%M')}**  | "
+        f"Salida objetivo: **{EXIT_TARGET.strftime('%H:%M')}**"
+    )
+    st.caption(
+        f"Ventana ENTRADA: {ENTRY_WINDOW_START.strftime('%H:%M')}–{ENTRY_WINDOW_END.strftime('%H:%M')} | "
+        f"Ventana SALIDA: {EXIT_WINDOW_START.strftime('%H:%M')}–{EXIT_WINDOW_END.strftime('%H:%M')}"
     )
 
     if tipo is None:
         st.warning("Fuera de horario permitido para marcar asistencia.")
     else:
-        st.success(f"Tipo de marca detectado: **{tipo}** (objetivo: {ENTRY_TARGET.strftime('%H:%M')} / {EXIT_TARGET.strftime('%H:%M')})")
+        st.success(f"Tipo de marca detectado: **{tipo}**")
 
     img_file = st.camera_input("Toma tu selfie")
 
     if img_file is not None:
-        # bytes originales de la cámara (los usamos para Drive)
         raw_bytes = img_file.getvalue()
-
-        # decodificamos para reconocimiento
         file_bytes = np.asarray(bytearray(raw_bytes), dtype=np.uint8)
         img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
@@ -287,12 +275,11 @@ with tab1:
                 st.error(f"No identificado. score={score:.3f} (umbral={threshold:.2f})")
                 st.stop()
 
-            # Sheets
             ws = open_sheet()
             ensure_sheet_header(ws)
             df = read_attendance_df(ws)
 
-            # Reglas
+            # Reglas de negocio
             if tipo == "ENTRADA":
                 if marked_today(df, name, "ENTRADA"):
                     st.info(f"{name} ya marcó **ENTRADA** hoy. (no se duplica)")
@@ -306,28 +293,15 @@ with tab1:
                     st.info(f"{name} ya marcó **SALIDA** hoy. (no se duplica)")
                     st.stop()
 
-            # Drive upload (guardamos foto)
-            if not DRIVE_FOLDER_ID:
-                st.error("Falta DRIVE_FOLDER_ID en Secrets. Crea carpeta en Drive, compártela con la service account y pega el ID.")
-                st.stop()
-
-            safe_name = "".join(c for c in name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
-            ts = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M-%S")
-            filename = f"{ts}_{safe_name}_{tipo}.jpg"
-
-            foto_url = upload_photo_to_drive(raw_bytes, filename)
-
-            # Append row
-            append_attendance(ws, name, tipo, score, foto_url)
+            append_attendance(ws, name, tipo, score)
 
             st.success(f"✅ {tipo} registrada: {name} (score={score:.3f})")
-            st.write("Foto guardada en Drive:", foto_url)
 
             st.subheader("Últimos registros")
             st.dataframe(read_attendance_df(ws).tail(15), use_container_width=True)
 
         except Exception as e:
-            st.error("Error (detalle):")
+            st.error("Error conectando con Google Sheets (detalle):")
             st.code(f"{type(e).__name__}: {e}")
             st.stop()
 
