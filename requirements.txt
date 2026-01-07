@@ -6,4 +6,6 @@ insightface
 onnxruntime
 gspread
 google-auth
+streamlit-js-eval
+
 
