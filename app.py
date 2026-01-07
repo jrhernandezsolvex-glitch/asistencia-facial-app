@@ -1,5 +1,6 @@
 # app.py — Asistencia facial (selfie 1 a 1) + Enrolamiento (admin) + ENTRADA/SALIDA por horario
 #        + Google Sheets (asistencias) + FaceDB en Sheets (embeddings persistentes) + GPS (lat/lon)
+#        + Navegación estable (NO vuelve al inicio en cada rerun) usando st.sidebar.radio
 # -----------------------------------------------------------------------------------------------
 # requirements.txt:
 # streamlit
@@ -90,7 +91,6 @@ def get_face_embedding(img_bgr):
     faces = model.get(img_bgr)
     if not faces:
         return None
-    # si hay varios rostros, elegir el más grande
     faces = sorted(
         faces,
         key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
@@ -102,7 +102,6 @@ def get_face_embedding(img_bgr):
 # SIMILARITY / IDENTIFICATION
 # ----------------------------
 def cosine_sim(a, b):
-    # embeddings ya normalizados por InsightFace (normed_embedding)
     return float(np.dot(a, b))
 
 def identify(db, emb, threshold):
@@ -143,17 +142,12 @@ def open_worksheet(name: str):
     try:
         return sh.worksheet(name)
     except gspread.WorksheetNotFound:
-        # crea la hoja si no existe
         return sh.add_worksheet(title=name, rows=2000, cols=20)
 
 # ----------------------------
 # SHEET HELPERS (ASISTENCIA)
 # ----------------------------
 def ensure_attendance_header(ws):
-    """
-    IMPORTANTE: NO usar insert_row porque termina duplicando headers
-    y "parece" que se borran registros.
-    """
     values = ws.get_all_values()
     if not values:
         ws.append_row(ATT_HEADER, value_input_option="USER_ENTERED")
@@ -178,7 +172,6 @@ def read_attendance_df(ws):
     rows = values[1:]
     df = pd.DataFrame(rows, columns=header)
 
-    # asegurar columnas
     for col in ATT_HEADER:
         if col not in df.columns:
             df[col] = ""
@@ -210,7 +203,7 @@ def append_attendance(ws, name, tipo, score, geo):
 
     ws.append_row(
         [now, name, tipo, round(float(score), 4), lat, lon, acc],
-        value_input_option="USER_ENTERED"
+        value_input_option="USER_ENTERED",
     )
 
 # ----------------------------
@@ -299,7 +292,6 @@ def delete_person_from_sheet(name: str):
 # BUSINESS LOGIC: ENTRY / EXIT
 # ----------------------------
 def decide_tipo(now_t: time):
-    """Devuelve ENTRADA, SALIDA o None si está fuera de horario permitido."""
     if ENTRY_WINDOW_START <= now_t <= ENTRY_WINDOW_END:
         return "ENTRADA"
     if EXIT_WINDOW_START <= now_t <= EXIT_WINDOW_END:
@@ -312,11 +304,24 @@ def decide_tipo(now_t: time):
 st.title(APP_TITLE)
 st.caption("Toma una selfie. Se registrará ENTRADA o SALIDA según la hora y se guardará en Google Sheets.")
 
+# Navegación estable (evita que se regrese a Marcar asistencia en cada rerun)
+if "page" not in st.session_state:
+    st.session_state.page = "📸 Marcar asistencia"
+
+page = st.sidebar.radio(
+    "Menú",
+    ["📸 Marcar asistencia", "⚙️ Administración"],
+    index=0 if st.session_state.page == "📸 Marcar asistencia" else 1,
+)
+st.session_state.page = page
+
+# DB desde Sheets
 db = load_db_from_sheet()
 
-tab1, tab2 = st.tabs(["📸 Marcar asistencia", "⚙️ Administración"])
-
-with tab1:
+# ----------------------------
+# PÁGINA 1: MARCAR ASISTENCIA
+# ----------------------------
+if page == "📸 Marcar asistencia":
     threshold = st.slider("Umbral de reconocimiento", 0.30, 0.60, float(DEFAULT_THRESHOLD), 0.01)
     st.write(f"Personas registradas: **{len(db)}**")
 
@@ -408,7 +413,10 @@ with tab1:
             st.code(f"{type(e).__name__}: {e}")
             st.stop()
 
-with tab2:
+# ----------------------------
+# PÁGINA 2: ADMINISTRACIÓN
+# ----------------------------
+if page == "⚙️ Administración":
     st.subheader("Enrolar personas (solo admin)")
 
     if ADMIN_PASSWORD:
@@ -452,6 +460,9 @@ with tab2:
 
             st.session_state.enroll_embs = []
             st.success(f"Registrado en FaceDB: {name}")
+
+            # Mantenerse en Administración
+            st.session_state.page = "⚙️ Administración"
             st.rerun()
 
     st.divider()
@@ -464,6 +475,9 @@ with tab2:
         if del_name.strip() and del_name.strip() in db_live:
             delete_person_from_sheet(del_name.strip())
             st.success("Eliminado de FaceDB.")
+
+            # Mantenerse en Administración
+            st.session_state.page = "⚙️ Administración"
             st.rerun()
         else:
             st.error("No existe ese nombre.")
