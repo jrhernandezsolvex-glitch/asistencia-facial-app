@@ -1,5 +1,6 @@
-# app.py — Asistencia facial (selfie 1 a 1) + Enrolamiento (admin) + ENTRADA/SALIDA por horario + Google Sheets
-# -------------------------------------------------------------------------------------------------
+# app.py — Asistencia facial (selfie 1 a 1) + Enrolamiento (admin) + ENTRADA/SALIDA por horario
+#        + Google Sheets (asistencias) + FaceDB en Sheets (embeddings persistentes) + GPS (lat/lon)
+# -----------------------------------------------------------------------------------------------
 # requirements.txt:
 # streamlit
 # numpy
@@ -9,6 +10,7 @@
 # onnxruntime
 # gspread
 # google-auth
+# streamlit-js-eval
 #
 # Streamlit Secrets (Settings → Secrets):
 # SHEET_NAME = "Asistencia Facial"
@@ -18,16 +20,15 @@
 #
 # [gcp_service_account]
 # type="service_account"
-# project_id="asistencia-facial-solvex"
+# project_id="..."
 # private_key_id="..."
 # private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-# client_email="...@asistencia-facial-solvex.iam.gserviceaccount.com"
+# client_email="...@....iam.gserviceaccount.com"
 # client_id="..."
 # token_uri="https://oauth2.googleapis.com/token"
-# -------------------------------------------------------------------------------------------------
 
-import os
-from datetime import datetime, date, time
+import base64
+from datetime import datetime, time
 
 import numpy as np
 import pandas as pd
@@ -40,6 +41,8 @@ from google.oauth2.service_account import Credentials
 from insightface.app import FaceAnalysis
 from zoneinfo import ZoneInfo
 
+from streamlit_js_eval import get_geolocation
+
 # ----------------------------
 # CONFIG
 # ----------------------------
@@ -51,11 +54,11 @@ APP_TITLE = "✅ Asistencia por Selfie (Entrada/Salida)"
 DEFAULT_THRESHOLD = 0.38
 
 SHEET_NAME = st.secrets.get("SHEET_NAME", "Asistencia Facial")
-WORKSHEET_NAME = st.secrets.get("WORKSHEET_NAME", "Hoja 1")
+WORKSHEET_NAME = st.secrets.get("WORKSHEET_NAME", "Hoja 1")  # asistencia
 SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
 
-DB_FILE = "face_db_multi.npz"
+FACE_DB_SHEET = "FaceDB"  # hoja para embeddings (persistente)
 
 # Horarios objetivo (informativos)
 ENTRY_TARGET = time(7, 45)   # 07:45
@@ -67,6 +70,10 @@ ENTRY_WINDOW_END   = time(11, 59)
 
 EXIT_WINDOW_START  = time(12, 0)
 EXIT_WINDOW_END    = time(20, 30)
+
+# Encabezados
+ATT_HEADER = ["fecha_hora", "nombre", "tipo", "score", "lat", "lon", "accuracy_m"]
+FACE_HEADER = ["nombre", "emb_b64", "created_at"]
 
 # ----------------------------
 # FACE MODEL (cache)
@@ -92,33 +99,10 @@ def get_face_embedding(img_bgr):
     return faces[0].normed_embedding.astype(np.float32)
 
 # ----------------------------
-# DB (multi embeddings per person)
+# SIMILARITY / IDENTIFICATION
 # ----------------------------
-def load_db():
-    if not os.path.exists(DB_FILE):
-        return {}
-    data = np.load(DB_FILE, allow_pickle=True)
-    names = data["names"].tolist()
-    embs = data["embs"]
-    db = {}
-    for name, emb in zip(names, embs):
-        db.setdefault(name, []).append(emb.astype(np.float32))
-    return db
-
-def save_db(db):
-    names, embs = [], []
-    for name, arr in db.items():
-        for emb in arr:
-            names.append(name)
-            embs.append(emb)
-
-    if not embs:
-        np.savez(DB_FILE, names=np.array([], dtype=object), embs=np.zeros((0, 512), np.float32))
-    else:
-        np.savez(DB_FILE, names=np.array(names, dtype=object), embs=np.stack(embs).astype(np.float32))
-
 def cosine_sim(a, b):
-    # embeddings ya normalizados
+    # embeddings ya normalizados por InsightFace (normed_embedding)
     return float(np.dot(a, b))
 
 def identify(db, emb, threshold):
@@ -145,48 +129,64 @@ def get_gs_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.readonly",
     ]
-
     creds = Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
     return gspread.authorize(creds)
 
-def open_sheet():
+def open_spreadsheet():
     gc = get_gs_client()
     if SPREADSHEET_ID and str(SPREADSHEET_ID).strip():
-        sh = gc.open_by_key(str(SPREADSHEET_ID).strip())
-    else:
-        sh = gc.open(SHEET_NAME)
-    return sh.worksheet(WORKSHEET_NAME)
+        return gc.open_by_key(str(SPREADSHEET_ID).strip())
+    return gc.open(SHEET_NAME)
+
+def open_worksheet(name: str):
+    sh = open_spreadsheet()
+    try:
+        return sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        # crea la hoja si no existe
+        return sh.add_worksheet(title=name, rows=2000, cols=20)
 
 # ----------------------------
-# SHEET HELPERS
+# SHEET HELPERS (ASISTENCIA)
 # ----------------------------
-def ensure_sheet_header(ws):
+def ensure_attendance_header(ws):
+    """
+    IMPORTANTE: NO usar insert_row porque termina duplicando headers
+    y "parece" que se borran registros.
+    """
     values = ws.get_all_values()
     if not values:
-        ws.append_row(["fecha_hora", "nombre", "tipo", "score"], value_input_option="USER_ENTERED")
+        ws.append_row(ATT_HEADER, value_input_option="USER_ENTERED")
         return
 
     header = values[0]
-    needed = ["fecha_hora", "nombre", "tipo", "score"]
-    if header != needed:
-        # Insertar header correcto como primera fila (no borra nada)
-        ws.insert_row(needed, index=1)
+
+    # Si tu hoja actual tiene 4 columnas, ampliamos a 7 pero SIN insertar filas.
+    if header[:4] == ["fecha_hora", "nombre", "tipo", "score"]:
+        ws.update("A1:G1", [ATT_HEADER])
+        return
+
+    # Si estaba distinto, forzamos la fila 1 a ATT_HEADER (sin insertar)
+    ws.update("A1:G1", [ATT_HEADER])
 
 def read_attendance_df(ws):
     values = ws.get_all_values()
     if not values:
-        return pd.DataFrame(columns=["fecha_hora", "nombre", "tipo", "score"])
+        return pd.DataFrame(columns=ATT_HEADER)
+
     header = values[0]
     rows = values[1:]
     df = pd.DataFrame(rows, columns=header)
+
     # asegurar columnas
-    for col in ["fecha_hora", "nombre", "tipo", "score"]:
+    for col in ATT_HEADER:
         if col not in df.columns:
             df[col] = ""
-    return df[["fecha_hora", "nombre", "tipo", "score"]]
+
+    return df[ATT_HEADER]
 
 def marked_today(df, name, tipo):
-    today_str = date.today().isoformat()
+    today_str = datetime.now(TZ).date().isoformat()
     if df.empty:
         return False
     mask = (
@@ -199,9 +199,101 @@ def marked_today(df, name, tipo):
 def has_entry_today(df, name):
     return marked_today(df, name, "ENTRADA")
 
-def append_attendance(ws, name, tipo, score):
+def append_attendance(ws, name, tipo, score, geo):
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-    ws.append_row([now, name, tipo, round(float(score), 4)], value_input_option="USER_ENTERED")
+
+    lat, lon, acc = "", "", ""
+    if geo and geo.get("coords"):
+        lat = geo["coords"].get("latitude", "")
+        lon = geo["coords"].get("longitude", "")
+        acc = geo["coords"].get("accuracy", "")
+
+    ws.append_row(
+        [now, name, tipo, round(float(score), 4), lat, lon, acc],
+        value_input_option="USER_ENTERED"
+    )
+
+# ----------------------------
+# FACE DB in GOOGLE SHEETS (PERSISTENTE)
+# ----------------------------
+def ensure_face_header(ws):
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(FACE_HEADER, value_input_option="USER_ENTERED")
+        return
+    ws.update("A1:C1", [FACE_HEADER])
+
+def emb_to_b64(emb: np.ndarray) -> str:
+    raw = emb.astype(np.float32).tobytes()
+    return base64.b64encode(raw).decode("utf-8")
+
+def b64_to_emb(s: str):
+    try:
+        raw = base64.b64decode(s.encode("utf-8"))
+        emb = np.frombuffer(raw, dtype=np.float32)
+        if emb.shape[0] != 512:
+            return None
+        return emb
+    except Exception:
+        return None
+
+@st.cache_data(ttl=30)
+def load_db_from_sheet():
+    ws = open_worksheet(FACE_DB_SHEET)
+    ensure_face_header(ws)
+
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        return {}
+
+    header = values[0]
+    rows = values[1:]
+    df = pd.DataFrame(rows, columns=header)
+
+    db = {}
+    for _, r in df.iterrows():
+        name = str(r.get("nombre", "")).strip()
+        emb_s = str(r.get("emb_b64", "")).strip()
+        if not name or not emb_s:
+            continue
+        emb = b64_to_emb(emb_s)
+        if emb is None:
+            continue
+        db.setdefault(name, []).append(emb.astype(np.float32))
+    return db
+
+def add_embeddings_to_sheet(name: str, embs: list):
+    ws = open_worksheet(FACE_DB_SHEET)
+    ensure_face_header(ws)
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    rows = []
+    for emb in embs:
+        rows.append([name, emb_to_b64(emb), now])
+
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    load_db_from_sheet.clear()
+
+def delete_person_from_sheet(name: str):
+    ws = open_worksheet(FACE_DB_SHEET)
+    ensure_face_header(ws)
+
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        return
+
+    header = values[0]
+    rows = values[1:]
+    df = pd.DataFrame(rows, columns=header)
+
+    df2 = df[df["nombre"].astype(str).str.strip() != name.strip()].copy()
+
+    ws.clear()
+    ws.append_row(FACE_HEADER, value_input_option="USER_ENTERED")
+    if not df2.empty:
+        ws.append_rows(df2[FACE_HEADER].values.tolist(), value_input_option="USER_ENTERED")
+
+    load_db_from_sheet.clear()
 
 # ----------------------------
 # BUSINESS LOGIC: ENTRY / EXIT
@@ -220,7 +312,7 @@ def decide_tipo(now_t: time):
 st.title(APP_TITLE)
 st.caption("Toma una selfie. Se registrará ENTRADA o SALIDA según la hora y se guardará en Google Sheets.")
 
-db = load_db()
+db = load_db_from_sheet()
 
 tab1, tab2 = st.tabs(["📸 Marcar asistencia", "⚙️ Administración"])
 
@@ -229,8 +321,7 @@ with tab1:
     st.write(f"Personas registradas: **{len(db)}**")
 
     now_dt = datetime.now(TZ)
-    now_t = now_dt.time()
-    tipo = decide_tipo(now_t)
+    tipo = decide_tipo(now_dt.time())
 
     st.info(
         f"Hora actual: **{now_dt.strftime('%H:%M:%S')}**  | "
@@ -246,6 +337,18 @@ with tab1:
         st.warning("Fuera de horario permitido para marcar asistencia.")
     else:
         st.success(f"Tipo de marca detectado: **{tipo}**")
+
+    st.subheader("📍 Geolocalización (GPS)")
+    st.caption("Dale permiso al navegador cuando lo pida. Si no lo permites, la marca igual se registra sin GPS.")
+    geo = get_geolocation()
+
+    if geo and geo.get("coords"):
+        st.success(
+            f"GPS OK: lat={geo['coords'].get('latitude')}, lon={geo['coords'].get('longitude')}, "
+            f"±{geo['coords'].get('accuracy')} m"
+        )
+    else:
+        st.info("GPS aún no disponible (o permiso denegado).")
 
     img_file = st.camera_input("Toma tu selfie")
 
@@ -275,8 +378,8 @@ with tab1:
                 st.error(f"No identificado. score={score:.3f} (umbral={threshold:.2f})")
                 st.stop()
 
-            ws = open_sheet()
-            ensure_sheet_header(ws)
+            ws = open_worksheet(WORKSHEET_NAME)
+            ensure_attendance_header(ws)
             df = read_attendance_df(ws)
 
             # Reglas de negocio
@@ -293,7 +396,7 @@ with tab1:
                     st.info(f"{name} ya marcó **SALIDA** hoy. (no se duplica)")
                     st.stop()
 
-            append_attendance(ws, name, tipo, score)
+            append_attendance(ws, name, tipo, score, geo)
 
             st.success(f"✅ {tipo} registrada: {name} (score={score:.3f})")
 
@@ -343,27 +446,24 @@ with tab2:
             st.error("Aún faltan selfies para completar el enrolamiento.")
         else:
             name = new_name.strip()
-            db.setdefault(name, [])
-            db[name].extend(st.session_state.enroll_embs[: int(n_photos)])
-            save_db(db)
+            embs = st.session_state.enroll_embs[: int(n_photos)]
+
+            add_embeddings_to_sheet(name, embs)
+
             st.session_state.enroll_embs = []
-            st.success(f"Registrado: {name}")
+            st.success(f"Registrado en FaceDB: {name}")
             st.rerun()
 
     st.divider()
-    st.subheader("Personas registradas")
-    st.write({k: len(v) for k, v in db.items()})
+    st.subheader("Personas registradas (FaceDB)")
+    db_live = load_db_from_sheet()
+    st.write({k: len(v) for k, v in db_live.items()})
 
     del_name = st.text_input("Nombre exacto a eliminar")
     if st.button("🗑️ Eliminar persona"):
-        if del_name.strip() in db:
-            del db[del_name.strip()]
-            save_db(db)
-            st.success("Eliminado.")
+        if del_name.strip() and del_name.strip() in db_live:
+            delete_person_from_sheet(del_name.strip())
+            st.success("Eliminado de FaceDB.")
             st.rerun()
         else:
             st.error("No existe ese nombre.")
-
-
-
-
