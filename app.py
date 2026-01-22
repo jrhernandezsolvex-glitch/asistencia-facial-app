@@ -1,19 +1,8 @@
-# app.py — Asistencia facial (selfie 1 a 1) + Enrolamiento (admin) + ENTRADA/SALIDA por horario
+# app.py — Asistencia facial (selfie 1 a 1) + Enrolamiento (admin)
+#        + ENTRADA/SALIDA por horario (modo MIXTO robusto)
 #        + Google Sheets (asistencias) + FaceDB en Sheets (embeddings persistentes)
-#        + GPS (lat/lon/accuracy) + Dirección (reverse geocode OSM, más preciso)
-#        + Navegación estable (NO vuelve al inicio en cada rerun) usando st.sidebar.radio
-#
-# requirements.txt:
-# streamlit
-# numpy
-# pandas
-# opencv-python-headless
-# insightface
-# onnxruntime
-# gspread
-# google-auth
-# streamlit-js-eval
-# requests
+#        + GPS (lat/lon/accuracy) + Dirección (reverse geocode OSM)
+#        + Navegación estable usando st.sidebar.radio
 
 import base64
 import requests
@@ -60,6 +49,14 @@ ENTRY_WINDOW_END   = time(11, 59)
 EXIT_WINDOW_START  = time(12, 0)
 EXIT_WINDOW_END    = time(20, 30)
 
+# ✅ MODO MIXTO
+# - Dentro de ventana: tipo por hora
+# - Fuera de ventana: permite marcar igual (con advertencia), y decide tipo alternando
+MIXED_MODE_ALLOW_OUTSIDE_WINDOWS = True
+
+# ✅ Si está fuera de ventana, permitir que el usuario elija manualmente (opcional)
+ALLOW_MANUAL_CHOICE_OUTSIDE_WINDOWS = True
+
 # Encabezados
 ATT_HEADER = ["fecha_hora", "nombre", "tipo", "score", "lat", "lon", "accuracy_m", "direccion"]
 FACE_HEADER = ["nombre", "emb_b64", "created_at"]
@@ -79,7 +76,6 @@ def get_face_embedding(img_bgr):
     faces = model.get(img_bgr)
     if not faces:
         return None
-    # si hay varios rostros, elegir el más grande
     faces = sorted(
         faces,
         key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
@@ -88,10 +84,9 @@ def get_face_embedding(img_bgr):
     return faces[0].normed_embedding.astype(np.float32)
 
 # ----------------------------
-# DB identification
+# IDENTIFICATION
 # ----------------------------
 def cosine_sim(a, b):
-    # embeddings ya normalizados
     return float(np.dot(a, b))
 
 def identify(db, emb, threshold):
@@ -132,7 +127,7 @@ def open_worksheet(name: str):
     try:
         return sh.worksheet(name)
     except gspread.WorksheetNotFound:
-        return sh.add_worksheet(title=name, rows=2000, cols=20)
+        return sh.add_worksheet(title=name, rows=5000, cols=20)
 
 # ----------------------------
 # SHEET HELPERS (Asistencia)
@@ -142,13 +137,14 @@ def ensure_attendance_header(ws):
     if not values:
         ws.append_row(ATT_HEADER, value_input_option="USER_ENTERED")
         return
-    # NO insert_row: solo fija encabezado
     ws.update("A1:H1", [ATT_HEADER])
 
 def read_attendance_df(ws):
     values = ws.get_all_values()
     if not values:
-        return pd.DataFrame(columns=ATT_HEADER)
+        df = pd.DataFrame(columns=ATT_HEADER)
+        df["_dt"] = pd.to_datetime([], errors="coerce")
+        return df
 
     header = values[0]
     rows = values[1:]
@@ -158,31 +154,46 @@ def read_attendance_df(ws):
         if col not in df.columns:
             df[col] = ""
 
-    return df[ATT_HEADER]
+    df = df[ATT_HEADER].copy()
+
+    # ✅ parseo robusto de fecha_hora (soporta YYYY-MM-DD, DD/MM/YYYY, etc.)
+    df["_dt"] = pd.to_datetime(df["fecha_hora"], errors="coerce", infer_datetime_format=True)
+
+    return df
+
+def _today_date():
+    return datetime.now(TZ).date()
 
 def marked_today(df, name, tipo):
-    today_str = datetime.now(TZ).date().isoformat()
     if df.empty:
         return False
-    mask = (
-        (df["nombre"].astype(str) == name) &
-        (df["tipo"].astype(str) == tipo) &
-        (df["fecha_hora"].astype(str).str.startswith(today_str))
-    )
-    return bool(mask.any())
+    today = _today_date()
+    sub = df[(df["nombre"].astype(str) == name) & (df["tipo"].astype(str) == tipo)].copy()
+    sub = sub[sub["_dt"].notna()]
+    if sub.empty:
+        return False
+    return bool((sub["_dt"].dt.date == today).any())
 
 def has_entry_today(df, name):
     return marked_today(df, name, "ENTRADA")
 
+def last_tipo_today(df, name):
+    if df.empty:
+        return None
+    today = _today_date()
+    sub = df[df["nombre"].astype(str) == name].copy()
+    sub = sub[sub["_dt"].notna()]
+    sub = sub[sub["_dt"].dt.date == today]
+    if sub.empty:
+        return None
+    sub = sub.sort_values("_dt")
+    return str(sub.iloc[-1]["tipo"])
+
 # ----------------------------
-# Reverse geocoding (más preciso)
+# Reverse geocoding (NO bloquea el marcado)
 # ----------------------------
 @st.cache_data(ttl=3600)
 def reverse_geocode(lat, lon):
-    """
-    Convierte lat/lon a dirección (texto) con Nominatim (OpenStreetMap).
-    Nota: la dirección depende de la precisión del GPS (accuracy_m).
-    """
     try:
         url = "https://nominatim.openstreetmap.org/reverse"
         params = {
@@ -191,22 +202,16 @@ def reverse_geocode(lat, lon):
             "format": "json",
             "zoom": 19,
             "addressdetails": 1,
-            "extratags": 1,
-            "namedetails": 1,
         }
         headers = {
-            # Nominatim pide User-Agent identificable
-            "User-Agent": "Asistencia-Facial-SOLVEX/1.0 (contacto@solvexing.com)"
+            "User-Agent": "Asistencia-Facial-SOLVEX/1.2 (contacto@solvexing.com)"
         }
-
-        r = requests.get(url, params=params, headers=headers, timeout=6)
+        r = requests.get(url, params=params, headers=headers, timeout=4)
         if r.status_code != 200:
             return ""
-
         data = r.json()
         addr = data.get("address", {})
 
-        # Construcción manual para mejorar consistencia
         road = addr.get("road") or addr.get("pedestrian") or addr.get("footway") or ""
         house = addr.get("house_number") or ""
         neighbourhood = addr.get("neighbourhood") or addr.get("suburb") or addr.get("quarter") or ""
@@ -225,7 +230,6 @@ def reverse_geocode(lat, lon):
                 parts.append(p)
 
         return ", ".join([p for p in parts if p]).strip()
-
     except Exception:
         return ""
 
@@ -234,13 +238,16 @@ def append_attendance(ws, name, tipo, score, geo):
 
     lat, lon, acc, direccion = "", "", "", ""
 
-    if geo and geo.get("coords"):
-        lat = geo["coords"].get("latitude", "")
-        lon = geo["coords"].get("longitude", "")
-        acc = geo["coords"].get("accuracy", "")
+    try:
+        if geo and geo.get("coords"):
+            lat = geo["coords"].get("latitude", "")
+            lon = geo["coords"].get("longitude", "")
+            acc = geo["coords"].get("accuracy", "")
 
-        if lat != "" and lon != "":
-            direccion = reverse_geocode(lat, lon)
+            if lat != "" and lon != "":
+                direccion = reverse_geocode(lat, lon)
+    except Exception:
+        direccion = ""
 
     ws.append_row(
         [now, name, tipo, round(float(score), 4), lat, lon, acc, direccion],
@@ -301,10 +308,7 @@ def add_embeddings_to_sheet(name: str, embs: list):
     ensure_face_header(ws)
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-    rows = []
-    for emb in embs:
-        rows.append([name, emb_to_b64(emb), now])
-
+    rows = [[name, emb_to_b64(emb), now] for emb in embs]
     ws.append_rows(rows, value_input_option="USER_ENTERED")
     load_db_from_sheet.clear()
 
@@ -330,22 +334,46 @@ def delete_person_from_sheet(name: str):
     load_db_from_sheet.clear()
 
 # ----------------------------
-# BUSINESS LOGIC: ENTRY / EXIT
+# BUSINESS LOGIC: TIPO (MODO MIXTO)
 # ----------------------------
-def decide_tipo(now_t: time):
+def tipo_by_time(now_t: time):
     if ENTRY_WINDOW_START <= now_t <= ENTRY_WINDOW_END:
         return "ENTRADA"
     if EXIT_WINDOW_START <= now_t <= EXIT_WINDOW_END:
         return "SALIDA"
     return None
 
+def tipo_alternando(df, name):
+    last = last_tipo_today(df, name)
+    if last is None:
+        return "ENTRADA"
+    if last == "ENTRADA":
+        return "SALIDA"
+    return "ENTRADA"
+
+def decide_tipo_mixed(df, name):
+    """
+    Dentro de ventana -> tipo por hora.
+    Fuera -> si MIXED_MODE_ALLOW_OUTSIDE_WINDOWS: permite y alterna, si no, bloquea.
+    Devuelve: (tipo, in_window_bool)
+    """
+    now_t = datetime.now(TZ).time()
+    by_time = tipo_by_time(now_t)
+    if by_time is not None:
+        return by_time, True
+
+    # Fuera de ventana
+    if not MIXED_MODE_ALLOW_OUTSIDE_WINDOWS:
+        return None, False
+
+    return tipo_alternando(df, name), False
+
 # ----------------------------
 # UI
 # ----------------------------
 st.title(APP_TITLE)
-st.caption("Toma una selfie. Se registrará ENTRADA o SALIDA según la hora y se guardará en Google Sheets.")
+st.caption("Toma una selfie. Se registrará ENTRADA o SALIDA y se guardará en Google Sheets.")
 
-# Navegación estable (evita que se regrese a Marcar asistencia en cada rerun)
 if "page" not in st.session_state:
     st.session_state.page = "📸 Marcar asistencia"
 
@@ -366,25 +394,20 @@ if page == "📸 Marcar asistencia":
     st.write(f"Personas registradas: **{len(db)}**")
 
     now_dt = datetime.now(TZ)
-    tipo = decide_tipo(now_dt.time())
 
     st.info(
         f"Hora actual: **{now_dt.strftime('%H:%M:%S')}**  | "
         f"Entrada objetivo: **{ENTRY_TARGET.strftime('%H:%M')}**  | "
         f"Salida objetivo: **{EXIT_TARGET.strftime('%H:%M')}**"
     )
+
     st.caption(
         f"Ventana ENTRADA: {ENTRY_WINDOW_START.strftime('%H:%M')}–{ENTRY_WINDOW_END.strftime('%H:%M')} | "
         f"Ventana SALIDA: {EXIT_WINDOW_START.strftime('%H:%M')}–{EXIT_WINDOW_END.strftime('%H:%M')}"
     )
 
-    if tipo is None:
-        st.warning("Fuera de horario permitido para marcar asistencia.")
-    else:
-        st.success(f"Tipo de marca detectado: **{tipo}**")
-
     st.subheader("📍 Geolocalización (GPS)")
-    st.caption("En celular, permite ubicación con 'Precisa' si te lo pide. Se guardará dirección + precisión (accuracy_m).")
+    st.caption("En celular, permite ubicación con 'Precisa'. Se guardará dirección + precisión (accuracy_m).")
     geo = get_geolocation()
 
     if geo and geo.get("coords"):
@@ -411,13 +434,8 @@ if page == "📸 Marcar asistencia":
             st.error("❌ No hay personas registradas. Ve a ⚙️ Administración para enrolar.")
             st.stop()
 
-        if tipo is None:
-            st.error("No se puede registrar: fuera de la ventana de ENTRADA o SALIDA.")
-            st.stop()
-
         try:
             name, score = identify(db, emb, threshold)
-
             if name is None:
                 st.error(f"No identificado. score={score:.3f} (umbral={threshold:.2f})")
                 st.stop()
@@ -426,26 +444,47 @@ if page == "📸 Marcar asistencia":
             ensure_attendance_header(ws)
             df = read_attendance_df(ws)
 
-            # Reglas de negocio
-            if tipo == "ENTRADA":
-                if marked_today(df, name, "ENTRADA"):
-                    st.info(f"{name} ya marcó **ENTRADA** hoy. (no se duplica)")
-                    st.stop()
+            # ✅ MODO MIXTO: decidir tipo + saber si está en ventana
+            tipo_sugerido, in_window = decide_tipo_mixed(df, name)
 
-            if tipo == "SALIDA":
-                if not has_entry_today(df, name):
-                    st.error(f"{name} no tiene **ENTRADA** registrada hoy. No se permite SALIDA.")
-                    st.stop()
-                if marked_today(df, name, "SALIDA"):
-                    st.info(f"{name} ya marcó **SALIDA** hoy. (no se duplica)")
-                    st.stop()
+            if tipo_sugerido is None:
+                st.warning("Fuera de horario permitido para marcar asistencia.")
+                st.stop()
+
+            # Si está fuera de ventana, mostrar advertencia y permitir elección manual (opcional)
+            tipo = tipo_sugerido
+            if not in_window:
+                st.warning(
+                    f"Estás **fuera de la ventana horaria**. "
+                    f"Se sugiere marcar: **{tipo_sugerido}** (alternando según el último registro de hoy)."
+                )
+                if ALLOW_MANUAL_CHOICE_OUTSIDE_WINDOWS:
+                    tipo = st.radio(
+                        "Elige el tipo de marca (solo fuera de ventana):",
+                        options=["ENTRADA", "SALIDA"],
+                        index=0 if tipo_sugerido == "ENTRADA" else 1,
+                        horizontal=True,
+                    )
+
+            # Anti-duplicado por tipo en el día
+            if marked_today(df, name, tipo):
+                st.info(f"{name} ya marcó **{tipo}** hoy. (no se duplica)")
+                st.stop()
+
+            # Regla: SALIDA requiere ENTRADA (se mantiene)
+            if tipo == "SALIDA" and not has_entry_today(df, name):
+                st.error(f"{name} no tiene **ENTRADA** registrada hoy. No se permite SALIDA.")
+                st.stop()
 
             append_attendance(ws, name, tipo, score, geo)
 
             st.success(f"✅ {tipo} registrada: {name} (score={score:.3f})")
 
             st.subheader("Últimos registros")
-            st.dataframe(read_attendance_df(ws).tail(15), use_container_width=True)
+            st.dataframe(
+                read_attendance_df(ws).tail(15).drop(columns=["_dt"], errors="ignore"),
+                use_container_width=True
+            )
 
         except Exception as e:
             st.error("Error conectando con Google Sheets (detalle):")
@@ -500,7 +539,6 @@ if page == "⚙️ Administración":
             st.session_state.enroll_embs = []
             st.success(f"Registrado en FaceDB: {name}")
 
-            # Mantenerse en Administración
             st.session_state.page = "⚙️ Administración"
             st.rerun()
 
