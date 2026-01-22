@@ -1,12 +1,14 @@
 # app.py — Asistencia facial (selfie 1 a 1) + Enrolamiento (admin)
-#        + ENTRADA/SALIDA por horario (modo MIXTO robusto)
+#        + ENTRADA/SALIDA seleccionado por el técnico (SIN autodetección)
+#        + SALIDA solo si ya existe ENTRADA hoy
+#        + Confirmación obligatoria antes de registrar
 #        + Google Sheets (asistencias) + FaceDB en Sheets (embeddings persistentes)
 #        + GPS (lat/lon/accuracy) + Dirección (reverse geocode OSM)
 #        + Navegación estable usando st.sidebar.radio
 
 import base64
 import requests
-from datetime import datetime, time
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -37,25 +39,6 @@ SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
 
 FACE_DB_SHEET = "FaceDB"
-
-# Horarios objetivo (informativos)
-ENTRY_TARGET = time(7, 45)
-EXIT_TARGET  = time(17, 15)
-
-# Ventanas permitidas (tolerancia)
-ENTRY_WINDOW_START = time(7, 0)
-ENTRY_WINDOW_END   = time(11, 59)
-
-EXIT_WINDOW_START  = time(12, 0)
-EXIT_WINDOW_END    = time(20, 30)
-
-# ✅ MODO MIXTO
-# - Dentro de ventana: tipo por hora
-# - Fuera de ventana: permite marcar igual (con advertencia), y decide tipo alternando
-MIXED_MODE_ALLOW_OUTSIDE_WINDOWS = True
-
-# ✅ Si está fuera de ventana, permitir que el usuario elija manualmente (opcional)
-ALLOW_MANUAL_CHOICE_OUTSIDE_WINDOWS = True
 
 # Encabezados
 ATT_HEADER = ["fecha_hora", "nombre", "tipo", "score", "lat", "lon", "accuracy_m", "direccion"]
@@ -155,10 +138,7 @@ def read_attendance_df(ws):
             df[col] = ""
 
     df = df[ATT_HEADER].copy()
-
-    # ✅ parseo robusto de fecha_hora (soporta YYYY-MM-DD, DD/MM/YYYY, etc.)
     df["_dt"] = pd.to_datetime(df["fecha_hora"], errors="coerce", infer_datetime_format=True)
-
     return df
 
 def _today_date():
@@ -177,18 +157,6 @@ def marked_today(df, name, tipo):
 def has_entry_today(df, name):
     return marked_today(df, name, "ENTRADA")
 
-def last_tipo_today(df, name):
-    if df.empty:
-        return None
-    today = _today_date()
-    sub = df[df["nombre"].astype(str) == name].copy()
-    sub = sub[sub["_dt"].notna()]
-    sub = sub[sub["_dt"].dt.date == today]
-    if sub.empty:
-        return None
-    sub = sub.sort_values("_dt")
-    return str(sub.iloc[-1]["tipo"])
-
 # ----------------------------
 # Reverse geocoding (NO bloquea el marcado)
 # ----------------------------
@@ -203,9 +171,7 @@ def reverse_geocode(lat, lon):
             "zoom": 19,
             "addressdetails": 1,
         }
-        headers = {
-            "User-Agent": "Asistencia-Facial-SOLVEX/1.2 (contacto@solvexing.com)"
-        }
+        headers = {"User-Agent": "Asistencia-Facial-SOLVEX/1.4 (contacto@solvexing.com)"}
         r = requests.get(url, params=params, headers=headers, timeout=4)
         if r.status_code != 200:
             return ""
@@ -334,46 +300,12 @@ def delete_person_from_sheet(name: str):
     load_db_from_sheet.clear()
 
 # ----------------------------
-# BUSINESS LOGIC: TIPO (MODO MIXTO)
-# ----------------------------
-def tipo_by_time(now_t: time):
-    if ENTRY_WINDOW_START <= now_t <= ENTRY_WINDOW_END:
-        return "ENTRADA"
-    if EXIT_WINDOW_START <= now_t <= EXIT_WINDOW_END:
-        return "SALIDA"
-    return None
-
-def tipo_alternando(df, name):
-    last = last_tipo_today(df, name)
-    if last is None:
-        return "ENTRADA"
-    if last == "ENTRADA":
-        return "SALIDA"
-    return "ENTRADA"
-
-def decide_tipo_mixed(df, name):
-    """
-    Dentro de ventana -> tipo por hora.
-    Fuera -> si MIXED_MODE_ALLOW_OUTSIDE_WINDOWS: permite y alterna, si no, bloquea.
-    Devuelve: (tipo, in_window_bool)
-    """
-    now_t = datetime.now(TZ).time()
-    by_time = tipo_by_time(now_t)
-    if by_time is not None:
-        return by_time, True
-
-    # Fuera de ventana
-    if not MIXED_MODE_ALLOW_OUTSIDE_WINDOWS:
-        return None, False
-
-    return tipo_alternando(df, name), False
-
-# ----------------------------
 # UI
 # ----------------------------
 st.title(APP_TITLE)
-st.caption("Toma una selfie. Se registrará ENTRADA o SALIDA y se guardará en Google Sheets.")
+st.caption("Toma una selfie. Luego confirma si estás registrando ENTRADA o SALIDA.")
 
+# Navegación estable
 if "page" not in st.session_state:
     st.session_state.page = "📸 Marcar asistencia"
 
@@ -394,17 +326,7 @@ if page == "📸 Marcar asistencia":
     st.write(f"Personas registradas: **{len(db)}**")
 
     now_dt = datetime.now(TZ)
-
-    st.info(
-        f"Hora actual: **{now_dt.strftime('%H:%M:%S')}**  | "
-        f"Entrada objetivo: **{ENTRY_TARGET.strftime('%H:%M')}**  | "
-        f"Salida objetivo: **{EXIT_TARGET.strftime('%H:%M')}**"
-    )
-
-    st.caption(
-        f"Ventana ENTRADA: {ENTRY_WINDOW_START.strftime('%H:%M')}–{ENTRY_WINDOW_END.strftime('%H:%M')} | "
-        f"Ventana SALIDA: {EXIT_WINDOW_START.strftime('%H:%M')}–{EXIT_WINDOW_END.strftime('%H:%M')}"
-    )
+    st.info(f"Hora actual: **{now_dt.strftime('%Y-%m-%d %H:%M:%S')}**")
 
     st.subheader("📍 Geolocalización (GPS)")
     st.caption("En celular, permite ubicación con 'Precisa'. Se guardará dirección + precisión (accuracy_m).")
@@ -418,6 +340,7 @@ if page == "📸 Marcar asistencia":
     else:
         st.info("GPS aún no disponible (o permiso denegado).")
 
+    st.subheader("📸 Selfie")
     img_file = st.camera_input("Toma tu selfie")
 
     if img_file is not None:
@@ -435,56 +358,69 @@ if page == "📸 Marcar asistencia":
             st.stop()
 
         try:
+            # 1) identificar persona
             name, score = identify(db, emb, threshold)
             if name is None:
                 st.error(f"No identificado. score={score:.3f} (umbral={threshold:.2f})")
                 st.stop()
 
+            st.success(f"👤 Identificado: **{name}** (score={score:.3f})")
+
+            # 2) leer asistencia actual
             ws = open_worksheet(WORKSHEET_NAME)
             ensure_attendance_header(ws)
             df = read_attendance_df(ws)
 
-            # ✅ MODO MIXTO: decidir tipo + saber si está en ventana
-            tipo_sugerido, in_window = decide_tipo_mixed(df, name)
+            # 3) habilitar opciones según estado del día
+            entry_exists = has_entry_today(df, name)
 
-            if tipo_sugerido is None:
-                st.warning("Fuera de horario permitido para marcar asistencia.")
-                st.stop()
-
-            # Si está fuera de ventana, mostrar advertencia y permitir elección manual (opcional)
-            tipo = tipo_sugerido
-            if not in_window:
-                st.warning(
-                    f"Estás **fuera de la ventana horaria**. "
-                    f"Se sugiere marcar: **{tipo_sugerido}** (alternando según el último registro de hoy)."
+            if entry_exists:
+                tipo = st.radio(
+                    "¿Qué deseas registrar?",
+                    options=["ENTRADA", "SALIDA"],
+                    index=1,  # por defecto: SALIDA si ya hay ENTRADA
+                    horizontal=True,
                 )
-                if ALLOW_MANUAL_CHOICE_OUTSIDE_WINDOWS:
-                    tipo = st.radio(
-                        "Elige el tipo de marca (solo fuera de ventana):",
-                        options=["ENTRADA", "SALIDA"],
-                        index=0 if tipo_sugerido == "ENTRADA" else 1,
-                        horizontal=True,
-                    )
+            else:
+                st.warning("Hoy aún no tienes **ENTRADA** registrada. Solo se permite marcar **ENTRADA**.")
+                tipo = "ENTRADA"
 
-            # Anti-duplicado por tipo en el día
+            # 4) avisos y validaciones antes de registrar
             if marked_today(df, name, tipo):
-                st.info(f"{name} ya marcó **{tipo}** hoy. (no se duplica)")
+                st.info(f"Ya marcaste **{tipo}** hoy. (no se duplica)")
                 st.stop()
 
-            # Regla: SALIDA requiere ENTRADA (se mantiene)
-            if tipo == "SALIDA" and not has_entry_today(df, name):
-                st.error(f"{name} no tiene **ENTRADA** registrada hoy. No se permite SALIDA.")
+            if tipo == "SALIDA" and not entry_exists:
+                st.error("No se permite SALIDA sin ENTRADA el mismo día.")
                 st.stop()
 
-            append_attendance(ws, name, tipo, score, geo)
-
-            st.success(f"✅ {tipo} registrada: {name} (score={score:.3f})")
-
-            st.subheader("Últimos registros")
-            st.dataframe(
-                read_attendance_df(ws).tail(15).drop(columns=["_dt"], errors="ignore"),
-                use_container_width=True
+            # 5) Confirmación obligatoria
+            st.divider()
+            st.subheader("✅ Confirmación")
+            confirm = st.checkbox(
+                f"Confirmo que deseo registrar **{tipo}** para **{name}** ahora.",
+                value=False
             )
+
+            disabled = not confirm
+            if st.button("📌 REGISTRAR", disabled=disabled, use_container_width=True):
+                # doble verificación (por si cambió el sheet entre el checkbox y el click)
+                df2 = read_attendance_df(ws)
+                if marked_today(df2, name, tipo):
+                    st.info(f"Ya marcaste **{tipo}** hoy. (no se duplica)")
+                    st.stop()
+                if tipo == "SALIDA" and not has_entry_today(df2, name):
+                    st.error("No se permite SALIDA sin ENTRADA el mismo día.")
+                    st.stop()
+
+                append_attendance(ws, name, tipo, score, geo)
+                st.success(f"✅ {tipo} registrada: {name} (score={score:.3f})")
+
+                st.subheader("Últimos registros")
+                st.dataframe(
+                    read_attendance_df(ws).tail(15).drop(columns=["_dt"], errors="ignore"),
+                    use_container_width=True
+                )
 
         except Exception as e:
             st.error("Error conectando con Google Sheets (detalle):")
@@ -552,7 +488,6 @@ if page == "⚙️ Administración":
         if del_name.strip() and del_name.strip() in db_live:
             delete_person_from_sheet(del_name.strip())
             st.success("Eliminado de FaceDB.")
-
             st.session_state.page = "⚙️ Administración"
             st.rerun()
         else:
