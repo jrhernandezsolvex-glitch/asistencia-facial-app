@@ -3,13 +3,14 @@
 #        + Anti-duplicado: si duplica ENTRADA o SALIDA en el día => error fijo
 #        + NO requiere ENTRADA para permitir SALIDA
 #        + GPS OBLIGATORIO (no deja continuar sin permiso)
-#        + CÁMARA OBLIGATORIA (no deja continuar sin permiso)
+#        + CÁMARA: NO confundir "sin foto" con "sin permiso"
+#        + Mensaje de puntualidad para ENTRADA (corte 07:46)
 #        + Google Sheets (asistencias) + FaceDB en Sheets (embeddings persistentes)
 #        + Dirección (reverse geocode OSM)
 
 import base64
 import requests
-from datetime import datetime
+from datetime import datetime, time
 
 import numpy as np
 import pandas as pd
@@ -45,6 +46,9 @@ ATT_HEADER = ["fecha_hora", "nombre", "tipo", "score", "lat", "lon", "accuracy_m
 FACE_HEADER = ["nombre", "emb_b64", "created_at"]
 
 DUPLICATE_ERROR_MSG = "❌ Duplicidad de marcación, verifique marcaje."
+
+# ✅ corte de puntualidad
+PUNCTUAL_CUTOFF = time(7, 46, 0)  # 07:46:00
 
 # ----------------------------
 # FACE MODEL (cache)
@@ -171,7 +175,7 @@ def reverse_geocode(lat, lon):
             "zoom": 19,
             "addressdetails": 1,
         }
-        headers = {"User-Agent": "Asistencia-Facial-SOLVEX/1.7 (contacto@solvexing.com)"}
+        headers = {"User-Agent": "Asistencia-Facial-SOLVEX/1.8 (contacto@solvexing.com)"}
         r = requests.get(url, params=params, headers=headers, timeout=4)
         if r.status_code != 200:
             return ""
@@ -203,10 +207,10 @@ def append_attendance(ws, name, tipo, score, geo):
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     lat, lon, acc, direccion = "", "", "", ""
-    # GPS/dirección deben existir (GPS obligatorio), pero igual no romper si el reverse geocode falla
     lat = geo["coords"].get("latitude", "")
     lon = geo["coords"].get("longitude", "")
     acc = geo["coords"].get("accuracy", "")
+
     try:
         if lat != "" and lon != "":
             direccion = reverse_geocode(lat, lon)
@@ -321,19 +325,19 @@ db = load_db_from_sheet()
 if page == "📸 Marcar asistencia":
     threshold = st.slider("Umbral de reconocimiento", 0.30, 0.60, float(DEFAULT_THRESHOLD), 0.01)
     st.write(f"Personas registradas: **{len(db)}**")
-    st.info(f"Hora actual: **{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}**")
+    now_dt = datetime.now(TZ)
+    st.info(f"Hora actual: **{now_dt.strftime('%Y-%m-%d %H:%M:%S')}**")
 
-    # ✅ Siempre seleccionar tipo (sin autodetección)
     tipo = st.radio("¿Qué deseas registrar?", ["ENTRADA", "SALIDA"], horizontal=True, index=0)
 
-    # ✅ GPS obligatorio — insistir hasta que el usuario permita
+    # ✅ GPS obligatorio
     st.subheader("📍 Geolocalización (OBLIGATORIA)")
     st.caption("Si no te aparece el permiso, revisa el ícono 🔒/ubicación del navegador y habilítalo.")
     geo = get_geolocation()
 
     if not geo or not geo.get("coords"):
-        st.error("⚠️ Permiso de ubicación NO concedido. Habilítalo para continuar.")
-        st.info("👉 En Chrome: clic en el ícono 🔒 junto a la URL → 'Ubicación' → Permitir → recargar.")
+        st.error("⚠️ Debes habilitar el permiso de ubicación (GPS) para registrar asistencia.")
+        st.info("👉 Chrome/Edge: clic en el ícono 🔒 junto a la URL → Ubicación → Permitir → recargar.")
         st.stop()
 
     st.success(
@@ -341,14 +345,14 @@ if page == "📸 Marcar asistencia":
         f"±{geo['coords'].get('accuracy')} m"
     )
 
-    # ✅ Cámara obligatoria — insistir hasta que permita
+    # ✅ Cámara: NO confundir falta de foto con falta de permiso
     st.subheader("📸 Cámara (OBLIGATORIA)")
-    st.caption("Si no te aparece el permiso, revisa el ícono de cámara del navegador y habilítalo.")
+    st.caption("Cuando estés listo, presiona **Take Photo**. Si no ves la imagen, habilita el permiso de cámara en el navegador.")
     img_file = st.camera_input("Toma tu selfie")
 
+    # 🔥 Cambiado: esto NO es error de permiso, solo indica que aún no se tomó la foto
     if img_file is None:
-        st.error("⚠️ Permiso de cámara NO concedido o cámara no disponible. Habilítala para continuar.")
-        st.info("👉 En Chrome: ícono de cámara en la barra de URL → Permitir → recargar.")
+        st.warning("📸 Toma la foto para continuar (botón **Take Photo**).")
         st.stop()
 
     # Procesar selfie
@@ -371,18 +375,26 @@ if page == "📸 Marcar asistencia":
             st.error(f"No identificado. score={score:.3f} (umbral={threshold:.2f})")
             st.stop()
 
-        st.success(f"👤 Identificado: **{name}** (score={score:.3f})")
-
         ws = open_worksheet(WORKSHEET_NAME)
         ensure_attendance_header(ws)
         df = read_attendance_df(ws)
 
-        # ✅ Anti-duplicidad por tipo (ENTRADA/SALIDA) en el día
+        # Anti-duplicidad por tipo (ENTRADA/SALIDA) en el día
         if marked_today(df, name, tipo):
             st.error(DUPLICATE_ERROR_MSG)
             st.stop()
 
         append_attendance(ws, name, tipo, score, geo)
+
+        # ✅ Mensajes de bienvenida/puntualidad
+        if tipo == "ENTRADA":
+            if now_dt.time() <= PUNCTUAL_CUTOFF:
+                st.success("Bienvenido a Solvex, agradecemos tu puntualidad! ✅⏱️")
+            else:
+                st.warning("Bienvenido a Solvex! Estás llegando un poco tarde ⏰😅")
+        else:
+            st.success("✅ Marcación registrada correctamente.")
+
         st.success(f"✅ {tipo} registrada: {name} (score={score:.3f})")
 
         st.subheader("Últimos registros")
