@@ -1,10 +1,11 @@
 # app.py — Asistencia facial (selfie 1 a 1) + Enrolamiento (admin)
-#        + ENTRADA/SALIDA seleccionado por el técnico (SIN autodetección)
-#        + SALIDA solo si ya existe ENTRADA hoy
-#        + Confirmación obligatoria antes de registrar
+#        + Tipo seleccionado (ENTRADA/SALIDA) SIN autodetección por horario
+#        + Anti-duplicado: si duplica ENTRADA o SALIDA en el día => error fijo
+#        + NO requiere ENTRADA para permitir SALIDA
+#        + GPS OBLIGATORIO (no deja continuar sin permiso)
+#        + CÁMARA OBLIGATORIA (no deja continuar sin permiso)
 #        + Google Sheets (asistencias) + FaceDB en Sheets (embeddings persistentes)
-#        + GPS (lat/lon/accuracy) + Dirección (reverse geocode OSM)
-#        + Navegación estable usando st.sidebar.radio
+#        + Dirección (reverse geocode OSM)
 
 import base64
 import requests
@@ -40,9 +41,10 @@ ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
 
 FACE_DB_SHEET = "FaceDB"
 
-# Encabezados
 ATT_HEADER = ["fecha_hora", "nombre", "tipo", "score", "lat", "lon", "accuracy_m", "direccion"]
 FACE_HEADER = ["nombre", "emb_b64", "created_at"]
+
+DUPLICATE_ERROR_MSG = "❌ Duplicidad de marcación, verifique marcaje."
 
 # ----------------------------
 # FACE MODEL (cache)
@@ -145,6 +147,7 @@ def _today_date():
     return datetime.now(TZ).date()
 
 def marked_today(df, name, tipo):
+    """True si ya existe ese tipo (ENTRADA/SALIDA) hoy para esa persona."""
     if df.empty:
         return False
     today = _today_date()
@@ -154,11 +157,8 @@ def marked_today(df, name, tipo):
         return False
     return bool((sub["_dt"].dt.date == today).any())
 
-def has_entry_today(df, name):
-    return marked_today(df, name, "ENTRADA")
-
 # ----------------------------
-# Reverse geocoding (NO bloquea el marcado)
+# Reverse geocoding
 # ----------------------------
 @st.cache_data(ttl=3600)
 def reverse_geocode(lat, lon):
@@ -171,7 +171,7 @@ def reverse_geocode(lat, lon):
             "zoom": 19,
             "addressdetails": 1,
         }
-        headers = {"User-Agent": "Asistencia-Facial-SOLVEX/1.4 (contacto@solvexing.com)"}
+        headers = {"User-Agent": "Asistencia-Facial-SOLVEX/1.7 (contacto@solvexing.com)"}
         r = requests.get(url, params=params, headers=headers, timeout=4)
         if r.status_code != 200:
             return ""
@@ -203,15 +203,13 @@ def append_attendance(ws, name, tipo, score, geo):
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     lat, lon, acc, direccion = "", "", "", ""
-
+    # GPS/dirección deben existir (GPS obligatorio), pero igual no romper si el reverse geocode falla
+    lat = geo["coords"].get("latitude", "")
+    lon = geo["coords"].get("longitude", "")
+    acc = geo["coords"].get("accuracy", "")
     try:
-        if geo and geo.get("coords"):
-            lat = geo["coords"].get("latitude", "")
-            lon = geo["coords"].get("longitude", "")
-            acc = geo["coords"].get("accuracy", "")
-
-            if lat != "" and lon != "":
-                direccion = reverse_geocode(lat, lon)
+        if lat != "" and lon != "":
+            direccion = reverse_geocode(lat, lon)
     except Exception:
         direccion = ""
 
@@ -303,9 +301,8 @@ def delete_person_from_sheet(name: str):
 # UI
 # ----------------------------
 st.title(APP_TITLE)
-st.caption("Toma una selfie. Luego confirma si estás registrando ENTRADA o SALIDA.")
+st.caption("Selecciona ENTRADA o SALIDA, permite GPS y cámara, toma una selfie y se registrará en Google Sheets.")
 
-# Navegación estable
 if "page" not in st.session_state:
     st.session_state.page = "📸 Marcar asistencia"
 
@@ -324,108 +321,77 @@ db = load_db_from_sheet()
 if page == "📸 Marcar asistencia":
     threshold = st.slider("Umbral de reconocimiento", 0.30, 0.60, float(DEFAULT_THRESHOLD), 0.01)
     st.write(f"Personas registradas: **{len(db)}**")
+    st.info(f"Hora actual: **{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}**")
 
-    now_dt = datetime.now(TZ)
-    st.info(f"Hora actual: **{now_dt.strftime('%Y-%m-%d %H:%M:%S')}**")
+    # ✅ Siempre seleccionar tipo (sin autodetección)
+    tipo = st.radio("¿Qué deseas registrar?", ["ENTRADA", "SALIDA"], horizontal=True, index=0)
 
-    st.subheader("📍 Geolocalización (GPS)")
-    st.caption("En celular, permite ubicación con 'Precisa'. Se guardará dirección + precisión (accuracy_m).")
+    # ✅ GPS obligatorio — insistir hasta que el usuario permita
+    st.subheader("📍 Geolocalización (OBLIGATORIA)")
+    st.caption("Si no te aparece el permiso, revisa el ícono 🔒/ubicación del navegador y habilítalo.")
     geo = get_geolocation()
 
-    if geo and geo.get("coords"):
-        st.success(
-            f"GPS OK: lat={geo['coords'].get('latitude')}, lon={geo['coords'].get('longitude')}, "
-            f"±{geo['coords'].get('accuracy')} m"
-        )
-    else:
-        st.info("GPS aún no disponible (o permiso denegado).")
+    if not geo or not geo.get("coords"):
+        st.error("⚠️ Permiso de ubicación NO concedido. Habilítalo para continuar.")
+        st.info("👉 En Chrome: clic en el ícono 🔒 junto a la URL → 'Ubicación' → Permitir → recargar.")
+        st.stop()
 
-    st.subheader("📸 Selfie")
+    st.success(
+        f"GPS OK: lat={geo['coords'].get('latitude')}, lon={geo['coords'].get('longitude')}, "
+        f"±{geo['coords'].get('accuracy')} m"
+    )
+
+    # ✅ Cámara obligatoria — insistir hasta que permita
+    st.subheader("📸 Cámara (OBLIGATORIA)")
+    st.caption("Si no te aparece el permiso, revisa el ícono de cámara del navegador y habilítalo.")
     img_file = st.camera_input("Toma tu selfie")
 
-    if img_file is not None:
-        raw_bytes = img_file.getvalue()
-        file_bytes = np.asarray(bytearray(raw_bytes), dtype=np.uint8)
-        img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if img_file is None:
+        st.error("⚠️ Permiso de cámara NO concedido o cámara no disponible. Habilítala para continuar.")
+        st.info("👉 En Chrome: ícono de cámara en la barra de URL → Permitir → recargar.")
+        st.stop()
 
-        emb = get_face_embedding(img_bgr)
-        if emb is None:
-            st.error("No se detectó rostro. Intenta con mejor luz y más cerca.")
+    # Procesar selfie
+    raw_bytes = img_file.getvalue()
+    file_bytes = np.asarray(bytearray(raw_bytes), dtype=np.uint8)
+    img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    emb = get_face_embedding(img_bgr)
+    if emb is None:
+        st.error("No se detectó rostro. Intenta con mejor luz y más cerca.")
+        st.stop()
+
+    if len(db) == 0:
+        st.error("❌ No hay personas registradas. Ve a ⚙️ Administración para enrolar.")
+        st.stop()
+
+    try:
+        name, score = identify(db, emb, threshold)
+        if name is None:
+            st.error(f"No identificado. score={score:.3f} (umbral={threshold:.2f})")
             st.stop()
 
-        if len(db) == 0:
-            st.error("❌ No hay personas registradas. Ve a ⚙️ Administración para enrolar.")
+        st.success(f"👤 Identificado: **{name}** (score={score:.3f})")
+
+        ws = open_worksheet(WORKSHEET_NAME)
+        ensure_attendance_header(ws)
+        df = read_attendance_df(ws)
+
+        # ✅ Anti-duplicidad por tipo (ENTRADA/SALIDA) en el día
+        if marked_today(df, name, tipo):
+            st.error(DUPLICATE_ERROR_MSG)
             st.stop()
 
-        try:
-            # 1) identificar persona
-            name, score = identify(db, emb, threshold)
-            if name is None:
-                st.error(f"No identificado. score={score:.3f} (umbral={threshold:.2f})")
-                st.stop()
+        append_attendance(ws, name, tipo, score, geo)
+        st.success(f"✅ {tipo} registrada: {name} (score={score:.3f})")
 
-            st.success(f"👤 Identificado: **{name}** (score={score:.3f})")
+        st.subheader("Últimos registros")
+        st.dataframe(read_attendance_df(ws).tail(15).drop(columns=["_dt"], errors="ignore"), use_container_width=True)
 
-            # 2) leer asistencia actual
-            ws = open_worksheet(WORKSHEET_NAME)
-            ensure_attendance_header(ws)
-            df = read_attendance_df(ws)
-
-            # 3) habilitar opciones según estado del día
-            entry_exists = has_entry_today(df, name)
-
-            if entry_exists:
-                tipo = st.radio(
-                    "¿Qué deseas registrar?",
-                    options=["ENTRADA", "SALIDA"],
-                    index=1,  # por defecto: SALIDA si ya hay ENTRADA
-                    horizontal=True,
-                )
-            else:
-                st.warning("Hoy aún no tienes **ENTRADA** registrada. Solo se permite marcar **ENTRADA**.")
-                tipo = "ENTRADA"
-
-            # 4) avisos y validaciones antes de registrar
-            if marked_today(df, name, tipo):
-                st.info(f"Ya marcaste **{tipo}** hoy. (no se duplica)")
-                st.stop()
-
-            if tipo == "SALIDA" and not entry_exists:
-                st.error("No se permite SALIDA sin ENTRADA el mismo día.")
-                st.stop()
-
-            # 5) Confirmación obligatoria
-            st.divider()
-            st.subheader("✅ Confirmación")
-            confirm = st.checkbox(
-                f"Confirmo que deseo registrar **{tipo}** para **{name}** ahora.",
-                value=False
-            )
-
-            disabled = not confirm
-            if st.button("📌 REGISTRAR", disabled=disabled, use_container_width=True):
-                # doble verificación (por si cambió el sheet entre el checkbox y el click)
-                df2 = read_attendance_df(ws)
-                if marked_today(df2, name, tipo):
-                    st.info(f"Ya marcaste **{tipo}** hoy. (no se duplica)")
-                    st.stop()
-                if tipo == "SALIDA" and not has_entry_today(df2, name):
-                    st.error("No se permite SALIDA sin ENTRADA el mismo día.")
-                    st.stop()
-
-                append_attendance(ws, name, tipo, score, geo)
-                st.success(f"✅ {tipo} registrada: {name} (score={score:.3f})")
-
-                st.subheader("Últimos registros")
-                st.dataframe(
-                    read_attendance_df(ws).tail(15).drop(columns=["_dt"], errors="ignore"),
-                    use_container_width=True
-                )
-
-        except Exception as e:
-            st.error("Error conectando con Google Sheets (detalle):")
-            st.code(f"{type(e).__name__}: {e}")
-            st.stop()
+    except Exception as e:
+        st.error("Error conectando con Google Sheets (detalle):")
+        st.code(f"{type(e).__name__}: {e}")
+        st.stop()
 
 # ----------------------------
 # PÁGINA 2: ADMINISTRACIÓN
