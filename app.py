@@ -5,6 +5,7 @@
 #        + GPS OBLIGATORIO (no deja continuar sin permiso)
 #        + CÁMARA: NO confundir "sin foto" con "sin permiso"
 #        + Mensaje de puntualidad para ENTRADA (corte 07:46)
+#        + Mensaje de cierre para SALIDA
 #        + Google Sheets (asistencias) + FaceDB en Sheets (embeddings persistentes)
 #        + Dirección (reverse geocode OSM)
 
@@ -175,7 +176,7 @@ def reverse_geocode(lat, lon):
             "zoom": 19,
             "addressdetails": 1,
         }
-        headers = {"User-Agent": "Asistencia-Facial-SOLVEX/1.8 (contacto@solvexing.com)"}
+        headers = {"User-Agent": "Asistencia-Facial-SOLVEX/1.9 (contacto@solvexing.com)"}
         r = requests.get(url, params=params, headers=headers, timeout=4)
         if r.status_code != 200:
             return ""
@@ -345,12 +346,11 @@ if page == "📸 Marcar asistencia":
         f"±{geo['coords'].get('accuracy')} m"
     )
 
-    # ✅ Cámara: NO confundir falta de foto con falta de permiso
+    # ✅ Cámara: no confundir "sin foto" con "sin permiso"
     st.subheader("📸 Cámara (OBLIGATORIA)")
     st.caption("Cuando estés listo, presiona **Take Photo**. Si no ves la imagen, habilita el permiso de cámara en el navegador.")
     img_file = st.camera_input("Toma tu selfie")
 
-    # 🔥 Cambiado: esto NO es error de permiso, solo indica que aún no se tomó la foto
     if img_file is None:
         st.warning("📸 Toma la foto para continuar (botón **Take Photo**).")
         st.stop()
@@ -379,21 +379,20 @@ if page == "📸 Marcar asistencia":
         ensure_attendance_header(ws)
         df = read_attendance_df(ws)
 
-        # Anti-duplicidad por tipo (ENTRADA/SALIDA) en el día
         if marked_today(df, name, tipo):
             st.error(DUPLICATE_ERROR_MSG)
             st.stop()
 
         append_attendance(ws, name, tipo, score, geo)
 
-        # ✅ Mensajes de bienvenida/puntualidad
+        # ✅ Mensajes
         if tipo == "ENTRADA":
             if now_dt.time() <= PUNCTUAL_CUTOFF:
                 st.success("Bienvenido a Solvex, agradecemos tu puntualidad! ✅⏱️")
             else:
                 st.warning("Bienvenido a Solvex! Estás llegando un poco tarde ⏰😅")
         else:
-            st.success("✅ Marcación registrada correctamente.")
+            st.success("¡Gran trabajo el de este día, te esperamos mañana! 💪🌟")
 
         st.success(f"✅ {tipo} registrada: {name} (score={score:.3f})")
 
