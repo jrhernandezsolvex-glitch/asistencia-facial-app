@@ -145,7 +145,11 @@ def read_attendance_df(ws):
             df[col] = ""
 
     df = df[ATT_HEADER].copy()
-    df["_dt"] = pd.to_datetime(df["fecha_hora"], errors="coerce", infer_datetime_format=True)
+    df["_dt"] = pd.to_datetime(
+        df["fecha_hora"],
+        errors="coerce",
+        format="%Y-%m-%d %H:%M:%S"
+    )
     return df
 
 def _today_date():
