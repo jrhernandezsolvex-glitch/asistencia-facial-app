@@ -1,14 +1,16 @@
-streamlit
-numpy
-pandas
-opencv-python-headless
-insightface
-onnxruntime
-gspread
-google-auth
-streamlit-js-eval
-requests
-
+streamlit==1.37.1
+numpy==1.26.4
+pandas==2.2.2
+insightface==0.7.3
+onnxruntime==1.18.1
+gspread==6.1.2
+google-auth==2.33.0
+streamlit-js-eval==0.1.7
+requests==2.32.3
+Pillow==10.4.0
+scikit-image==0.24.0
+scipy==1.13.1
+tqdm==4.66.5
 
 
 
