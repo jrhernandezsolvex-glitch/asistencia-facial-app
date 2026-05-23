@@ -38,10 +38,18 @@ TZ = ZoneInfo("America/Lima")
 APP_TITLE = "✅ Control de asistencia SOLVEX (Entrada/Salida)"
 DEFAULT_THRESHOLD = 0.38
 
-SHEET_NAME = st.secrets.get("SHEET_NAME", "Asistencia Facial")
-WORKSHEET_NAME = st.secrets.get("WORKSHEET_NAME", "Hoja 1")
-SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")
-ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
+# Lectura segura de secrets.
+# Esto evita que la app se caiga en Codespaces cuando no existe .streamlit/secrets.toml.
+try:
+    SHEET_NAME = st.secrets.get("SHEET_NAME", "Asistencia Facial")
+    WORKSHEET_NAME = st.secrets.get("WORKSHEET_NAME", "Hoja 1")
+    SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")
+    ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
+except Exception:
+    SHEET_NAME = "Asistencia Facial"
+    WORKSHEET_NAME = "Hoja 1"
+    SPREADSHEET_ID = ""
+    ADMIN_PASSWORD = ""
 
 FACE_DB_SHEET = "FaceDB"
 
@@ -71,7 +79,7 @@ def image_file_to_bgr(uploaded_file):
 # ----------------------------
 # FACE MODEL (cache)
 # ----------------------------
-@st.cache_resource
+@st.cache_resource(show_spinner="Cargando modelo de reconocimiento facial...")
 def load_model():
     app = FaceAnalysis(name="buffalo_l")
 
@@ -82,10 +90,13 @@ def load_model():
     return app
 
 
-model = load_model()
-
-
 def get_face_embedding(img_bgr):
+    """
+    Carga el modelo recién cuando se necesita procesar una foto.
+    Así la app no se queda cargando al inicio.
+    """
+    model = load_model()
+
     faces = model.get(img_bgr)
 
     if not faces:
@@ -127,10 +138,17 @@ def identify(db, emb, threshold):
 # ----------------------------
 @st.cache_resource
 def get_gs_client():
-    creds_info = st.secrets.get("gcp_service_account")
+    try:
+        creds_info = st.secrets.get("gcp_service_account")
+    except Exception:
+        creds_info = None
 
     if creds_info is None:
         st.error("Faltan credenciales en Secrets: [gcp_service_account].")
+        st.info(
+            "Si estás probando en Codespaces, este error es normal hasta que configures "
+            "los secrets locales. En Streamlit Cloud deben estar en Manage app → Settings → Secrets."
+        )
         st.stop()
 
     scopes = [
@@ -445,6 +463,9 @@ page = st.sidebar.radio(
 
 st.session_state.page = page
 
+
+# Cargar base facial solo después de mostrar la interfaz.
+# Si faltan secrets, aquí mostrará el aviso claro y se detendrá.
 db = load_db_from_sheet()
 
 
