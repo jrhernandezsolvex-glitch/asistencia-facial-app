@@ -10,8 +10,19 @@
 #        + Dirección (reverse geocode OSM)
 #        + Versión sin OpenCV/cv2 para evitar errores en Streamlit Cloud
 
+import os
+
+# Limita los hilos nativos para evitar saturación y caídas en Streamlit Cloud.
+# Estas variables deben establecerse antes de importar NumPy, ONNX Runtime
+# o InsightFace.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import base64
 import io
+import threading
 import requests
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
@@ -57,13 +68,23 @@ PUNCTUAL_CUTOFF = time(7, 46, 0)  # 07:46:00
 # ----------------------------
 # IMAGE HELPER SIN CV2
 # ----------------------------
-def image_file_to_bgr(uploaded_file):
+def image_file_to_bgr(uploaded_file, max_dimension=1280):
     """
     Convierte la imagen tomada con st.camera_input a formato BGR,
     compatible con InsightFace, sin usar OpenCV/cv2.
+
+    También reduce imágenes muy grandes para disminuir el consumo de memoria
+    durante la inferencia en Streamlit Cloud.
     """
     image = Image.open(io.BytesIO(uploaded_file.getvalue())).convert("RGB")
-    img_rgb = np.array(image)
+
+    if max(image.size) > max_dimension:
+        image.thumbnail(
+            (max_dimension, max_dimension),
+            Image.Resampling.LANCZOS,
+        )
+
+    img_rgb = np.asarray(image, dtype=np.uint8)
     img_bgr = img_rgb[:, :, ::-1].copy()
     return img_bgr
 
@@ -71,22 +92,43 @@ def image_file_to_bgr(uploaded_file):
 # ----------------------------
 # FACE MODEL (cache)
 # ----------------------------
-@st.cache_resource
+# El modelo almacenado por st.cache_resource puede ser compartido entre
+# sesiones. Este lock evita inferencias simultáneas sobre ONNX Runtime.
+MODEL_LOCK = threading.Lock()
+
+
+@st.cache_resource(show_spinner="Cargando reconocimiento facial...")
 def load_model():
-    app = FaceAnalysis(name="buffalo_l")
+    face_app = FaceAnalysis(
+        name="buffalo_l",
+        providers=["CPUExecutionProvider"],
+        allowed_modules=["detection", "recognition"],
+    )
 
     # ctx_id=-1 fuerza CPU.
-    # Es más compatible con Streamlit Cloud que ctx_id=0.
-    app.prepare(ctx_id=-1, det_size=(640, 640))
+    # 320x320 reduce significativamente el consumo frente a 640x640.
+    face_app.prepare(
+        ctx_id=-1,
+        det_size=(320, 320),
+    )
 
-    return app
+    return face_app
 
 
 model = load_model()
 
 
 def get_face_embedding(img_bgr):
-    faces = model.get(img_bgr)
+    if img_bgr is None or not isinstance(img_bgr, np.ndarray) or img_bgr.size == 0:
+        return None
+
+    try:
+        with MODEL_LOCK:
+            faces = model.get(img_bgr)
+    except Exception as exc:
+        st.error("No fue posible procesar la imagen con el modelo facial.")
+        st.code(f"{type(exc).__name__}: {exc}")
+        return None
 
     if not faces:
         return None
@@ -97,7 +139,12 @@ def get_face_embedding(img_bgr):
         reverse=True,
     )
 
-    return faces[0].normed_embedding.astype(np.float32)
+    embedding = faces[0].normed_embedding
+
+    if embedding is None:
+        return None
+
+    return np.asarray(embedding, dtype=np.float32)
 
 
 # ----------------------------
@@ -171,7 +218,7 @@ def ensure_attendance_header(ws):
         ws.append_row(ATT_HEADER, value_input_option="USER_ENTERED")
         return
 
-    ws.update("A1:H1", [ATT_HEADER])
+    ws.update(values=[ATT_HEADER], range_name="A1:H1")
 
 
 def read_attendance_df(ws):
@@ -196,7 +243,6 @@ def read_attendance_df(ws):
     df["_dt"] = pd.to_datetime(
         df["fecha_hora"],
         errors="coerce",
-        infer_datetime_format=True,
     )
 
     return df
@@ -331,7 +377,7 @@ def ensure_face_header(ws):
         ws.append_row(FACE_HEADER, value_input_option="USER_ENTERED")
         return
 
-    ws.update("A1:C1", [FACE_HEADER])
+    ws.update(values=[FACE_HEADER], range_name="A1:C1")
 
 
 def emb_to_b64(emb: np.ndarray) -> str:
